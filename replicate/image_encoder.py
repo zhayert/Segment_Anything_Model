@@ -16,12 +16,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops.layers.torch import Rearrange
 from einops import repeat, rearrange
+
+
 # from typing import Optional
 
 class ImageEncoder(nn.Module):
-    def __init__(self, image_size, patch_size, padding = 0, in_chans=3, embed_dim=768, use_abs_pos=True, depth=12,
-                 num_heads=12, mlp_ratio=4, qkv_bias=True, use_rel_pos=True, rel_pos_zero_init=0, window_size=0,
-                 out_chans = 256,global_atten_indexs=()):
+    def __init__(self, image_size,
+                 patch_size,
+                 padding=0, in_chans=3,
+                 embed_dim=768,
+                 use_abs_pos=True,
+                 depth=12,
+                 num_heads=12,
+                 mlp_ratio=4,
+                 qkv_bias=True,
+                 use_rel_pos=True,
+                 rel_pos_zero_init=0,
+                 window_size=0,
+                 out_chans=256,
+                 global_attn_indexs=()):
         super().__init__()
         self.image_size = image_size
 
@@ -43,17 +56,18 @@ class ImageEncoder(nn.Module):
             )
         self.blocks = nn.ModuleList()
         for i in range(depth):
-            block = Block(embed_dim, num_heads, mlp_ratio, qkv_bias, use_rel_pos, rel_pos_zero_init, window_size,
+            block = Block(embed_dim, num_heads,
+                          mlp_ratio, qkv_bias, use_rel_pos, rel_pos_zero_init,
+                          window_size=window_size if i not in global_attn_indexs else 0,
                           input_size=(image_size // patch_size, image_size // patch_size))
             self.blocks.append(block)
 
         self.neck = nn.Sequential(
-            nn.Conv2d(embed_dim, out_chans,kernel_size=1,bias=False),
+            nn.Conv2d(embed_dim, out_chans, kernel_size=1, bias=False),
             LayerNorm2d(out_chans),
-            nn.Conv2d(out_chans,out_chans,kernel_size=3,padding=1,bias=False),
+            nn.Conv2d(out_chans, out_chans, kernel_size=3, padding=1, bias=False),
             LayerNorm2d(out_chans),
         )
-
 
     def forward(self, img):
         x = self.proj(img)
@@ -63,9 +77,10 @@ class ImageEncoder(nn.Module):
         for b in self.blocks:
             x = b(x)
 
-        x = x.permute(0,3,1,2)
+        x = x.permute(0, 3, 1, 2)
         x = self.neck(x)
         return x
+
 
 class LayerNorm2d(nn.Module):
     def __init__(self, num_channels: int, eps: float = 1e-6) -> None:
@@ -123,6 +138,7 @@ class MLP(nn.Module):
         x = nn.GELU()(x)
         x = self.linear2(x)
         return x
+
 
 class Attention(nn.Module):
     """Multi-head Attention block with relative position embeddings."""
