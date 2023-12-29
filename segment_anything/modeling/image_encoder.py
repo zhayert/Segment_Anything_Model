@@ -401,8 +401,9 @@ class PatchEmbed(nn.Module):
 
 
 if __name__ == '__main__':
-    img = torch.randn(5, 3, 256, 256)
+    torch.manual_seed(42)
+    img = torch.load("../../a_tensor.pt")
     print(img.shape)
     vit = ImageEncoderViT(256, 16)
     preds = vit(img)
-    print(preds.shape)
+    print(preds)

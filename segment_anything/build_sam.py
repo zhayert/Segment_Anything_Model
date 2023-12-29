@@ -45,7 +45,7 @@ def build_sam_vit_b(checkpoint=None):
     )
 
 
-build_sam = build_sam_vit_b
+# build_sam = build_sam_vit_b
 
 sam_model_registry = {
     "default": build_sam_vit_h,
@@ -72,7 +72,8 @@ def _build_sam(
             embed_dim=encoder_embed_dim,
             img_size=image_size,
             mlp_ratio=4,
-            norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
+            # norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
+            norm_layer=partial(torch.nn.LayerNorm),
             num_heads=encoder_num_heads,
             patch_size=vit_patch_size,
             qkv_bias=True,
@@ -115,7 +116,7 @@ if __name__ == '__main__':
     sam_checkpoint = None
     model_type = "vit_b"
     sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
-    dummy_input = torch.randn(1, 3, 1024, 1024)
-    out = sam(dummy_input)
+    # dummy_input = torch.randn(1, 3, 1024, 1024)
+    # out = sam(dummy_input)
     print(sam)
-    print(out)
+    # print(out)

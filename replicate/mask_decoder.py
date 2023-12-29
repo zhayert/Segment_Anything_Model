@@ -14,38 +14,59 @@ from torch import nn
 from torch.nn import functional as F
 
 
-# from typing import
-
 class MaskDecoder(nn.Module):
-    def __init__(self, trm_dim, trm, num_multitask_outputs=3, iou_head_dpt=3, iou_head_hidden_dim=256):
+    def __init__(
+            self,
+            trm_dim,  # tranformer的channel
+            trm,  # 用于预测mask的网络transformer
+            num_multitask_outputs=3,  # 消除掩码歧义预测的掩码数
+            iou_head_dpt=3,  # MLP深度，MLP用于预测mask的质量
+            iou_head_hidden_dim=256  # MLP隐藏的channel
+    ):
         super().__init__()
-        self.trm_dim = trm_dim
-        self.trm = trm
+        self.trm_dim = trm_dim  # transformer的channel
 
-        self.num_multitask_outputs = num_multitask_outputs
+        # transformer：融合特征(提示信息特征与图像特征)获得粗略掩膜src
+        self.trm = trm  # 用于预测mask的网络transformer
 
-        self.iou_token = nn.Embedding(1, trm_dim)
-        self.num_mask_tokens = num_multitask_outputs + 1
-        self.mask_tokens = nn.Embedding(self.num_mask_tokens, trm_dim)
+        self.num_multitask_outputs = num_multitask_outputs  # 消除mask歧义预测的掩码数
+        self.iou_token = nn.Embedding(1, trm_dim)  # iou的token
+        self.num_mask_tokens = num_multitask_outputs + 1  # mask数
+        self.mask_tokens = nn.Embedding(self.num_mask_tokens, trm_dim)  # mask的tokens数
 
+        # upscaled：对粗略掩膜src进行4倍上采样
         self.output_upscaling = nn.Sequential(
-            nn.ConvTranspose2d(trm_dim, trm_dim // 4, kernel_size=2, stride=2),
+            nn.ConvTranspose2d(trm_dim, trm_dim // 4, kernel_size=2, stride=2),  # 转置卷积 上采样2倍
             LayerNorm2d(trm_dim // 4),
             nn.GELU(),
             nn.ConvTranspose2d(trm_dim // 4, trm_dim // 8, kernel_size=2, stride=2),
             nn.GELU(),
         )
+
+        # MLP
+        # 对应mask数的MLP：全连接层组(计算加权权重，使粗掩膜src转变为掩膜mask)
         self.output_hypernetworks_mlp = nn.ModuleList(
             [
-                MLP(trm_dim, trm_dim, trm_dim // 8, 3)
+                MLPBlock(trm_dim, trm_dim, trm_dim // 8, 3)
                 for i in range(self.num_mask_tokens)
             ])
-        self.iou_pred_head = MLP(trm_dim, iou_head_hidden_dim, self.num_mask_tokens, iou_head_dpt)
 
-    def forward(self, img_emb, img_pe, sparse_prompt_embed, dense_prompt_embed, multimask_output=False):
-        masks, iou_pred = self.pred_mask(img_emb, img_pe, sparse_prompt_embed, dense_prompt_embed)
+        # 对应iou的MLP：全连接层组(计算掩膜mask的Score)
+        self.iou_pred_head = MLPBlock(
+            trm_dim, iou_head_hidden_dim, self.num_mask_tokens, iou_head_dpt)
 
-        # select the correct mask or masks for output
+    def forward(
+            self,
+            image_embed,  # image encoder图像特征
+            image_pos_embed,  # image的pos embed
+            sparse_prompt_embed,  # 标记点和标记框的embed
+            dense_prompt_embed,  # 输入mask的embed
+            multimask_output=False  # 是否输出多个mask
+    ):
+
+        masks, iou_pred = self.pred_mask(image_embed, image_pos_embed, sparse_prompt_embed, dense_prompt_embed)
+
+        # 选择正确的一个或多个mask进行输出
         if multimask_output:
             mask_slice = slice(1, None)
         else:
@@ -55,42 +76,80 @@ class MaskDecoder(nn.Module):
 
         return masks, iou_pred
 
-    def pred_mask(self, img_embed, img_pe, sparse_prompt_embed, dense_prompt_embed):
+    def pred_mask(
+            self,
+            image_embed,
+            image_pos_embed,
+            sparse_prompt_embed,
+            dense_prompt_embed):
+        # 拼接output_tokens
+        # 1,E and 4,E --> 5,E
         output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight], dim=0)
         # 5,E --> B,5,E
         output_tokens = output_tokens.unsqueeze(0).expand(sparse_prompt_embed.size(0), -1, -1)
         # concat(B,5,E and B,N,E) --> B,5+N,E       N是点的个数(标记点和标记框的点)
         tokens = torch.cat((output_tokens, sparse_prompt_embed), dim=1)
 
+        # 扩展image_embedd的B维度,因为boxes标记分割时,n个box时batchsize = batchsize * n
         # B, C, H, W
-        src = torch.repeat_interleave(img_embed, tokens.shape[0], dim=0)
+        src = torch.repeat_interleave(image_embed, tokens.shape[0], dim=0)
         # B, C, H, W + 1, C, H, W --> B, C, H, W
         src = src + dense_prompt_embed
         # 1, C, H, W --> B, C, H, W
-        pos_src = torch.repeat_interleave(img_pe, tokens.shape[0], dim=0)
+        pos_src = torch.repeat_interleave(image_pos_embed, tokens.shape[0], dim=0)
         b, c, h, w = src.shape
 
         # transformer
+        # Run the transformer
+        # B, N, C
         hs, src = self.trm(src, pos_src, tokens)
+
         iou_token_out = hs[:, 0, :]
         mask_tokens_out = hs[:, 1:(1 + self.num_mask_tokens), :]
 
+        # 对mask_embed(src)进行上采样，并且使用mask_tokens来预测masks掩码
+        # B,N,C-->B,C,H,W
         src = src.transpose(1, 2).view(b, c, h, w)
+
+        # upscaled 4倍上采样
+        # 在MaskDecoder的predict_masks添加位置编码
         upscaled_embed = self.output_upscaling(src)
+
         hyper_in_list = []
+
+        # MLP Block
+        # 在MaskDecoder的predict_masks添加位置编码
         for i in range(self.num_mask_tokens):
+            # mask_tokens_out[:, i, :]: B,1,C
+            # output_hypernetworks_mlps: B,1,c
             hyper_in_list.append(self.output_hypernetworks_mlp[i](mask_tokens_out[:, i, :]))
+
+        # B, n, c
         hyper_in = torch.stack(hyper_in_list, dim=1)
         b, c, h, w = upscaled_embed.shape
-        masks = (hyper_in @ upscaled_embed.view(b, c, h * w).view(b, -1, h, w))
+        # B,n,c × B,c,N-->B,n,h,w
+        masks = (hyper_in @ upscaled_embed.view(b, c, h * w)).view(b, -1, h, w)
 
-        # Generate mask equality predictions
+        # --- iou MLP ---
+        # Generate mask quality predictions
+        # iou_token_out: B,1,n
         iou_pred = self.iou_pred_head(iou_token_out)
+        # --- iou MLP ---
+
+        # mask: B, n, h, w
+        # iou_pred: B, 1, n
         return masks, iou_pred
 
 
-class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, sigmoid_output=False):
+class MLPBlock(nn.Module):
+    def __init__(
+            self,
+            input_dim,  # 输入channel
+            hidden_dim,  # 中间channel
+            output_dim,  # 输出channel
+            num_layers,  # fc的层数
+            sigmoid_output=False
+    ):
         super().__init__()
         self.num_layers = num_layers
         h = [hidden_dim] * (num_layers - 1)
@@ -148,7 +207,7 @@ def test2():
     sigmoid_output = True
 
     # 创建 MLP 模型实例
-    model = MLP(input_dim, hidden_dim, output_dim, num_layers, sigmoid_output)
+    model = MLPBlock(input_dim, hidden_dim, output_dim, num_layers, sigmoid_output)
 
     # 生成随机输入数据
     input_data = torch.randn(5, input_dim)  # 5 个样本，每个样本有 10 个特征
@@ -163,171 +222,167 @@ def test2():
     print(output)
 
 
-# if __name__ == '__main__':
-#     transformer_dim = 256
-#     transformer = TwoWayTransformer(
-#         depth=2,
-#         embedding_dim=256,
-#         mlp_dim=2048,
-#         num_heads=8,
-#     )  # 需要提前定义
-#     image_size = (14, 14)
-#
-#     # 构建Model
-#     model = MaskDecoder(
-#         trm_dim=transformer_dim,
-#         trm=transformer
-#     )
-#
-#     # 测试数据
-#     image_embeddings = torch.rand(2, transformer_dim, 14, 14)
-#     image_pe = torch.rand(2, 256, 196)
-#     sparse_prompt_embeddings = torch.rand(2, 3, transformer_dim)
-#     dense_prompt_embeddings = torch.rand(4, transformer_dim, 14, 14)
-#
-#     # 测试前向传播
-#     masks, iou_pred = model(
-#         img_emb=image_embeddings,
-#         img_pe=image_pe,
-#         sparse_prompt_embed=sparse_prompt_embeddings,
-#         dense_prompt_embed=dense_prompt_embeddings,
-#         multimask_output=False
-#     )
-#
-#     # 打印输出大小
-#     print(masks.shape)
-#     print(iou_pred.shape)
-
-
 # 双向Transformer结构
 class TwoWayTransformer(nn.Module):
-    def __init__(self, depth, embed_dim, num_heads, mlp_dim, attention_downsample_rate=2):
+    def __init__(
+            self,
+            depth,  # 层数
+            embed_dim,  # 输入的channel
+            num_heads,  # attention的head数
+            mlp_dim,  # MLP内部的channel
+            # 用于对queries和keys的下采样，这可以在注意力机制中引入空间平均池化，以降低计算复杂性。
+            # 这种方式下采样旨在在保持有效性的同时减少计算需求。
+            attention_downsample_rate=2
+    ):
         super().__init__()
-        self.depth = depth
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.mlp_dim = mlp_dim
+        self.depth = depth  # 层数
+        self.embed_dim = embed_dim  # 输入的channel
+        self.num_heads = num_heads  # attention的head数
+        self.mlp_dim = mlp_dim  # MLP内部隐藏的channel
         self.layers = nn.ModuleList()
 
         # 包含多个TransformerBlock结构每个块都有两个方向的注意力机制。
         # 这些块被堆叠在一起，通过残差连接形成了一个深层的 Transformer 结构。
         for i in range(depth):
             self.layers.append(
-                TwoWayAttentionBlock(
-                    embed_dim=embed_dim,
-                    num_heads=num_heads,
-                    mlp_dim=mlp_dim,
-                    attention_downsample_rate=attention_downsample_rate,
+                TwoWayAttnBlock(
+                    embed_dim=embed_dim,  # 输入channel
+                    num_heads=num_heads,  # attention的head数
+                    mlp_dim=mlp_dim,  # MLP中间channel
+                    attention_downsample_rate=attention_downsample_rate,  # 下采样
                     skip_first_layer_pe=(i == 0),
                 )
             )
 
         # 在整个Transformer结构的最后，应用了一个额外的注意力层，保持性能的同时，提高模型的计算效率。
-        self.final_attn_token_to_image = Attention(
+        self.final_attn_token_to_image = MultiHeadAttn(
             embed_dim, num_heads, downsample_rate=attention_downsample_rate
         )
         self.norm_final_attn = nn.LayerNorm(embed_dim)
 
-    def forward(self, image_embed, image_pe, point_embed):
-        # 形状变换：在处理图像嵌入时，首先对其进行了形状变换，将其从形状为 BxCxHxW 的四维张量
-        # 展平为形状为 Bx(N_image_tokens)xC 的三维张量，以便在 Transformer 中使用。
+    def forward(self, image_embed, image_pos_embed, point_embed):
+        # 进行了形状变换， BxCxHxW -> Bx(N_image_tokens)xC,以便在 Transformer 中使用。
         # BxCxHxW -> BxHWxC == B x N_image_tokens x C
         bs, c, h, w = image_embed.shape
-        image_embed = image_embed.flatten(2).permute(0, 2, 1)
-        image_pe = image_pe.flatten(2).permute(0, 2, 1)
 
+        # image_embed
+        # BxHWxC => B,N,C
+        image_embed = image_embed.flatten(2).permute(0, 2, 1)
+
+        # image_pos_embed
+        # BxHWxC => B,N,C
+        image_pos_embed = image_pos_embed.flatten(2).permute(0, 2, 1)
+
+        # 标记点编码
+        # B，N，C
         queries = point_embed
         keys = image_embed
 
+        # --- TwoWayAttention---
         for layer in self.layers:
             queries, keys = layer(
                 queries=queries,
                 keys=keys,
-                query_pe=point_embed,
-                key_pe=image_pe,
+                query_pos_embed=point_embed,
+                key_pos_embed=image_pos_embed,
             )
+        # --- TwoWayAttention---
 
         q = queries + point_embed
-        k = keys + image_pe
-        attn_out = self.final_attn_token_to_image(q, k, v)
+        k = keys + image_pos_embed
+
+        # --- Attention ---
+        attn_out = self.final_attn_token_to_image(q, k, v=keys)
+        # --- Attention ---
+
         queries = queries + attn_out
         queries = self.norm_final_attn(queries)
 
         return queries, keys
 
 
-class TwoWayAttentionBlock(nn.Module):
-    def __init__(self,
-                 embed_dim,
-                 num_heads,
-                 mlp_dim,
-                 attention_downsample_rate=2,
-                 skip_first_layer_pe=False):
+# TwoWayAttention Block由LayerNorm, Multi-Head, Attention和MLP构成。
+# TwoWayAttentionBlock是Prompt encoder的提示信息特征与Image encoder的图像特征的融合过程，
+class TwoWayAttnBlock(nn.Module):
+    def __init__(
+            self,
+            embed_dim,  # 输入的channel
+            num_heads,  # attention的head
+            mlp_dim,  # MLP中的channel
+            attention_downsample_rate=2,  # 下采样
+            skip_first_layer_pe=False
+    ):
         super().__init__()
-        self.self_attn = Attention(embed_dim, num_heads)
+        self.self_attn = MultiHeadAttn(embed_dim, num_heads)
         self.norm1 = nn.LayerNorm(embed_dim)
 
-        self.cross_attn_token_to_image = Attention(
+        self.cross_attn_token_to_image = MultiHeadAttn(
             embed_dim, num_heads, downsample_rate=attention_downsample_rate
         )
         self.norm2 = nn.LayerNorm(embed_dim)
 
         self.lin1 = nn.Linear(embed_dim, mlp_dim)
-        self.act = nn.GELU()
+        self.act = nn.ReLU()
         self.lin2 = nn.Linear(mlp_dim, embed_dim)
+
         self.norm3 = nn.LayerNorm(embed_dim)
 
         self.norm4 = nn.LayerNorm(embed_dim)
-        self.cross_attn_token_to_image = Attention(embed_dim, num_heads, attention_downsample_rate)
+
+        self.cross_attn_image_to_token = MultiHeadAttn(
+            embed_dim, num_heads, attention_downsample_rate)
 
         self.skip_first_layer_pe = skip_first_layer_pe
 
-    def forward(self, queries, keys, query_pe, key_pe):
-        # 在这个函数中，query_pe和key_pe分别表示queries和keys的positional embeddings。
-        # 在Transformer模型中，位置嵌入用于为序列中的每个元素赋予一个唯一的位置编码，帮助模型理解元素之间的相对位置关系。
+    def forward(
+            self,
+            queries,  # 标记点编码相关（原始标记点编码经过一系列特征提取） queries
+            keys,  # 原始图像编码相关（原始图像编码经过一些列特征提取）  keyes
+            query_pos_embed,  # 原始标记点编码  point_embed
+            key_pos_embed  # 原始图像位置编码  image_pos_embed
+    ):
         if self.skip_first_layer_pe:
+            # 第一轮本身queries == query_pos_embed没法在比较残差
             queries = self.self_attn(queries, queries, queries)
         else:
-            q = queries + query_pe
+            q = queries + query_pos_embed
             attn_out = self.self_attn(q, q, queries)
             queries = queries + attn_out
         queries = self.norm1(queries)
 
-        # 使模型中tokens加入到image embedding
-        # 在处理序列数据时，有效地利用图像的信息，提高对序列中每个令牌的建模能力。
-        # 将输入的queries和query_pe相加。这一步的目的是引入关于查询令牌位置的信息。
-        q = queries + query_pe
-        k = keys + key_pe
-        # 使用cross_attn_token_to_image注意力层，计算注意力加权的输出attn_out。
+        # Cross attention block, tokens attending to image embedding
+        q = queries + query_pos_embed
+        k = keys + key_pos_embed
         attn_out = self.cross_attn_token_to_image(q, k, keys)
-        # 将原始的queries与attn_out相加，得到更新后的queries。
         queries = queries + attn_out
         queries = self.norm2(queries)
 
-        # 将更新后的queries输入到多层感知机块mlp中，得到mlp_out。
-        # 将原始的queries与mlp_out相加，得到更新后的queries。
-        # 对更新后的queries进行层归一化，得到最终的输出。
+        # MLP Block
         mlp_out = self.lin1(queries)
         mlp_out = self.act(mlp_out)
         mlp_out = self.lin2(mlp_out)
         queries = queries + mlp_out
         queries = self.norm3(queries)
 
-        # 再次的跨通道注意力块（CrossAttentionBlock）
-        # 将queries与查询的位置嵌入query_pe相加，将keys与键的位置嵌入key_pe相加。
-        # 使用cross_attn_image_to_token注意力层，计算注意力加权的输出attn_out。
-        # 将原始的keys与attn_out相加，得到更新后的keys。对更新后的keys进行层归一化，得到最终的输出。
-        q = queries + query_pe
-        k = keys + key_pe
-        attn_out = self.cross_attn_token_to_image(k, q, queries)
+        # Cross attention block, image embedding attention to tokens
+        q = queries + query_pos_embed
+        k = keys + key_pos_embed
+        attn_out = self.cross_attn_image_to_token(k, q, queries)
         keys = keys + attn_out
         keys = self.norm4(keys)
-
         return queries, keys
 
 
-class Attention(nn.Module):
-    def __init__(self, embed_dim, num_heads, downsample_rate=1):
+# Mask Decoder的Attention与ViT的Attention有些细微的不同：
+# Mask Decoder的Attention是3个FC层分别接受3个输入获得q、k和v。
+# ViT的Attention是1个FC层接受1个输入后将结果均拆分获得q、k和v。
+class MultiHeadAttn(nn.Module):
+    def __init__(
+            self,
+            embed_dim,  # 输入channel
+            num_heads,  # attention的head数
+            downsample_rate=1  # 下采样
+    ):
         super().__init__()
         self.embed_dim = embed_dim
         # internal_dim 表示在进行注意力计算时，嵌入向量会被投影到一个更低维度的空间。
@@ -336,53 +391,76 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         assert self.internal_dim % num_heads == 0, "num_head must divide embed_dim."
 
+        # qkv获取
         self.q_proj = nn.Linear(embed_dim, self.internal_dim)
         self.k_proj = nn.Linear(embed_dim, self.internal_dim)
         self.v_proj = nn.Linear(embed_dim, self.internal_dim)
-
         self.out_proj = nn.Linear(self.internal_dim, embed_dim)
 
     def separate_heads(self, x, num_heads):
         b, n, c = x.shape
         x = x.reshape(b, n, num_heads, c // num_heads)
-        x = x.transpose(1, 2)
+        x = x.transpose(1, 2)  # B x N_heads x N_tokens x C_per_head
         return x
 
     def forward(self, q, k, v):
-        # 投影
+        # 输入投影
         q = self.q_proj(q)
         k = self.k_proj(k)
         v = self.v_proj(v)
 
         # 多头分离
+        # B,N_heads,N_tokens,C_per_head
         q = self.separate_heads(q, self.num_heads)
         k = self.separate_heads(k, self.num_heads)
         v = self.separate_heads(v, self.num_heads)
 
-        # 自注意力机制
+        # Attention自注意力机制
         _, _, _, c_per_head = q.shape  # c_per_head
         attn = q @ k.permute(0, 1, 3, 2)  # Batch_size x N_heads x N_tokens x N_tokens
+        # Scale
         attn = attn / math.sqrt(c_per_head)
         attn = torch.softmax(attn, dim=-1)
-
         # 输出计算
         out = attn @ v
 
         # 用于将多头注意力计算的输出重新组合成一个张量,为了将多个头的注意力计算结果合并
         b, num_heads, num_tokens, c_per_head = out.shape
         out = out.transpose(1, 2)
-        out = out.reshape(b, num_heads, num_tokens * c_per_head)
+        out = out.reshape(b, num_tokens, num_heads * c_per_head)  # B x N_tokens x C
 
+        out = self.out_proj(out)
         return out
 
-# class MLPBlock(nn.Module):
-#     def __init__(self,embed_dim,mlp_dim):
-#         super().__init__()
-#         self.lin1 = nn.Linear(embed_dim,mlp_dim)
-#         self.lin2 = nn.Linear(mlp_dim,embed_dim)
-#
-#     def forward(self,x):
-#         x = self.lin1(x)
-#         x = nn.GELU()(x)
-#         x = self.lin2(x)
-#         return x
+
+if __name__ == '__main__':
+    # 构建TwoWayTransformer
+    transformer_dim = 256
+    transformer = TwoWayTransformer(depth=2, embed_dim=256, mlp_dim=2048, num_heads=8)
+
+    # 构建MaskDecoder
+    model = MaskDecoder(trm_dim=transformer_dim, trm=transformer)
+
+    # 生成匹配的输入
+    bs = 2
+    seq_len = 3
+    image_size = 14
+    transformer_dim = 256
+
+    image_embeddings = torch.rand(bs, transformer_dim, image_size, image_size)
+    image_pe = torch.rand(bs, transformer_dim, image_size ** 2)
+    sparse_prompt_embeddings = torch.rand(bs, seq_len, transformer_dim)
+
+    # 修正dense_prompt_embeddings的shape
+    dense_prompt_embeddings = torch.rand(bs, transformer_dim, image_size, image_size)
+
+    masks, iou_pred = model(
+        image_embed=image_embeddings,
+        image_pos_embed=image_pe,
+        sparse_prompt_embed=sparse_prompt_embeddings,
+        dense_prompt_embed=dense_prompt_embeddings,
+        multimask_output=False
+    )
+
+    print(masks.shape)
+    print(iou_pred.shape)

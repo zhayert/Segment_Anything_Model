@@ -51,7 +51,7 @@ class SamOnnxModel(nn.Module):
     def _embed_points(self, point_coords: torch.Tensor, point_labels: torch.Tensor) -> torch.Tensor:
         point_coords = point_coords + 0.5
         point_coords = point_coords / self.img_size
-        point_embedding = self.model.prompt_encoder.pe_layer._pe_encoding(point_coords)
+        point_embedding = self.model.prompt_encoder.pe_layer.pos_emb_encoding(point_coords)
         point_labels = point_labels.unsqueeze(-1).expand_as(point_embedding)
 
         point_embedding = point_embedding * (point_labels != -1)

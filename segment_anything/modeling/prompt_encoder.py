@@ -223,6 +223,7 @@ class PositionEmbeddingRandom(nn.Module):
 
 
 if __name__ == '__main__':
+    torch.manual_seed(42)
     # 创建一个 PromptEncoder 实例
     embed_dim = 256
     image_embedding_size = (14, 14)
@@ -237,19 +238,22 @@ if __name__ == '__main__':
     )
 
     # 创建一些测试数据
-    points = (torch.randn(2, 3, 2), torch.randint(0, 2, (2, 3)))
-    boxes = None
-    boxes = torch.randn(4, 3)
-    masks = None
+    points = (torch.randn(3, 2, 2), torch.randint(0, 2, (3, 2)))
+    # boxes = None
+    boxes = torch.randn(3, 4)
+    # masks = None
     masks = torch.randn(4, 1, 28, 28)
 
+    # points = None
+    # masks = None
     # 直接复用上面创建的实例
     # 通过数据测试forward函数
     embeddings = prompt_encoder(points, boxes, masks)
 
     # 打印outout的shape
-    print(embeddings[0].shape)
-    print(embeddings[1].shape)
+    # print(embeddings[0].shape)
+    # print(embeddings[1].shape)
+    print(embeddings)
 
 
 

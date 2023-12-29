@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
+from einops import rearrange
 from torch import nn
 from torch.nn import functional as F
 
@@ -43,8 +44,9 @@ class Sam(nn.Module):
         self.image_encoder = image_encoder
         self.prompt_encoder = prompt_encoder
         self.mask_decoder = mask_decoder
-        self.register_buffer("pixel_mean", torch.Tensor(pixel_mean).view(-1, 1, 1), False)
-        self.register_buffer("pixel_std", torch.Tensor(pixel_std).view(-1, 1, 1), False)
+        self.register_buffer("pixel_mean", rearrange(torch.Tensor(pixel_mean),'a -> a 1 1'), False)
+        self.register_buffer("pixel_std", rearrange(torch.Tensor(pixel_std),'a -> a 1 1'), False)
+
 
     @property
     def device(self) -> Any:
@@ -172,3 +174,7 @@ class Sam(nn.Module):
         padw = self.image_encoder.img_size - w
         x = F.pad(x, (0, padw, 0, padh))
         return x
+
+
+if __name__ == '__main__':
+    pass
