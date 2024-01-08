@@ -42,7 +42,7 @@ print(image.shape)  # (880, 1195, 3)
 # plt.show()
 
 
-sam_checkpoint = r"..\..\Segment_Anything_Model\pretrained\sam_vit_b_01ec64.pth"
+sam_checkpoint = r"..\..\ckpt\sam_ckpt\sam_vit_b_01ec64.pth"
 # model_type = "vit_b"
 
 device = "cuda"
